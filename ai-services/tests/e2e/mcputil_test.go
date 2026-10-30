@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,10 +13,136 @@ import (
 	"strings"
 	"time"
 
+	catalogConfig "github.com/project-ai-services/ai-services/internal/pkg/catalog/config"
 	"github.com/project-ai-services/ai-services/tests/e2e/common"
 )
 
+// mcpCallTool opens a fresh MCP session on endpoint, then invokes the named
+// tool with the given params map via a tools/call request.
+// The MCP sidecars run with --auth-passthrough, so every tools/call must carry
+// the catalog bearer token in the Authorization header.
+// The raw SSE-unwrapped JSON-RPC response payload is returned so callers can
+// unmarshal the result.content array themselves.
+func mcpCallTool(ctx context.Context, endpoint, toolName string, params map[string]any) ([]byte, error) {
+	client := mcpToolCallHTTPClient()
+
+	token, err := mcpBearerToken()
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 1 — initialize, capture session ID.
+	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"e2e-test","version":"1.0"}}}`
+	_, sessionID, err := mcpDoRequest(ctx, client, endpoint, initBody, "", token)
+	if err != nil {
+		return nil, fmt.Errorf("mcpCallTool initialize: %w", err)
+	}
+
+	// Step 2 — serialize params and issue tools/call.
+	callArgs, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("mcpCallTool marshal params: %w", err)
+	}
+	callBody := fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":%q,"arguments":%s}}`,
+		toolName, callArgs,
+	)
+	raw, _, err := mcpDoRequest(ctx, client, endpoint, callBody, sessionID, token)
+	if err != nil {
+		return nil, fmt.Errorf("mcpCallTool tools/call %s: %w", toolName, err)
+	}
+
+	return sseExtractData(raw), nil
+}
+
+// mcpBearerToken returns the catalog access token saved by 'catalog login'.
+func mcpBearerToken() (string, error) {
+	creds, err := catalogConfig.Load()
+	if err != nil {
+		return "", fmt.Errorf("load catalog credentials: %w", err)
+	}
+	if creds.AccessToken == "" {
+		return "", fmt.Errorf("catalog access token is empty — run catalog login first")
+	}
+
+	return creds.AccessToken, nil
+}
+
+// mcpToolResult is the JSON-RPC envelope returned by tools/call.
+type mcpToolResult struct {
+	Result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"result"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// mcpParseToolText decodes a tools/call response and returns content[0].text.
+// It returns an error for JSON-RPC errors, tool errors and empty content.
+func mcpParseToolText(raw []byte) (string, error) {
+	var env mcpToolResult
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return "", fmt.Errorf("decode tools/call response: %w (body: %s)", err, raw)
+	}
+	if env.Error != nil {
+		return "", fmt.Errorf("tools/call error %d: %s", env.Error.Code, env.Error.Message)
+	}
+	if len(env.Result.Content) == 0 {
+		return "", fmt.Errorf("tools/call result.content is empty (body: %s)", raw)
+	}
+	if env.Result.IsError {
+		return "", fmt.Errorf("tool returned isError: %s", env.Result.Content[0].Text)
+	}
+
+	return env.Result.Content[0].Text, nil
+}
+
+// mcpUpstreamError reports whether text is a service error envelope of the
+// form {"error":{...}} or {"detail":...}. The sidecar returns the upstream body
+// as text without checking the HTTP status, so a 4xx/5xx looks like success.
+func mcpUpstreamError(text string) error {
+	var probe struct {
+		Error  json.RawMessage `json:"error"`
+		Detail json.RawMessage `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(text), &probe); err != nil {
+		return nil
+	}
+	if len(probe.Error) > 0 && string(probe.Error) != "null" {
+		return fmt.Errorf("upstream service returned an error: %s", text)
+	}
+	if len(probe.Detail) > 0 && string(probe.Detail) != "null" {
+		return fmt.Errorf("upstream service returned an error: %s", text)
+	}
+
+	return nil
+}
+
+// mcpBase64File returns the standard base64 encoding of b, ready to embed as a
+// file entry in the "files" array of the create_digitize_job prototype body.
+func mcpBase64File(b []byte) string {
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// mcpEnsureEndpoint appends /mcp to url if it does not already end with /mcp.
+func mcpEnsureEndpoint(url string) string {
+	if strings.HasSuffix(url, "/mcp") {
+		return url
+	}
+
+	return strings.TrimSuffix(url, "/") + "/mcp"
+}
+
 const mcpRequestTimeout = 30 * time.Second //nolint:mnd
+
+// mcpToolCallTimeout bounds a single tools/call HTTP round-trip. It is much
+// longer than mcpRequestTimeout because chat completions and PDF uploads are slow.
+const mcpToolCallTimeout = 10 * time.Minute //nolint:mnd
 
 // mcpHTTPClient returns an HTTP client that skips TLS verification, suitable
 // for test environments that use self-signed certificates.
@@ -26,9 +153,19 @@ func mcpHTTPClient() *http.Client {
 	})
 }
 
+// mcpToolCallHTTPClient is like mcpHTTPClient but with a timeout long enough
+// for tools/call requests that proxy to slow upstream services.
+func mcpToolCallHTTPClient() *http.Client {
+	return common.GetHTTPClient(common.HTTPClientConfig{
+		Timeout:            mcpToolCallTimeout,
+		InsecureSkipVerify: true,
+	})
+}
+
 // mcpDoRequest sends a single MCP JSON-RPC POST to endpoint and returns the
 // raw response body bytes and the Mcp-Session-Id header value.
-func mcpDoRequest(ctx context.Context, client *http.Client, endpoint, body, sessionID string) ([]byte, string, error) {
+// A non-empty bearerToken is sent as the Authorization header.
+func mcpDoRequest(ctx context.Context, client *http.Client, endpoint, body, sessionID, bearerToken string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {
 		return nil, "", fmt.Errorf("build request: %w", err)
@@ -37,6 +174,9 @@ func mcpDoRequest(ctx context.Context, client *http.Client, endpoint, body, sess
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
 	}
 
 	resp, err := client.Do(req)
@@ -68,14 +208,14 @@ func mcpToolsForEndpoint(endpoint string) ([]map[string]any, error) {
 
 	// Step 1 — initialize.
 	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"e2e-test","version":"1.0"}}}`
-	_, sessionID, err := mcpDoRequest(ctx, client, endpoint, initBody, "")
+	_, sessionID, err := mcpDoRequest(ctx, client, endpoint, initBody, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("initialize: %w", err)
 	}
 
 	// Step 2 — tools/list.
 	listBody := `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`
-	raw, _, err := mcpDoRequest(ctx, client, endpoint, listBody, sessionID)
+	raw, _, err := mcpDoRequest(ctx, client, endpoint, listBody, sessionID, "")
 	if err != nil {
 		return nil, fmt.Errorf("tools/list: %w", err)
 	}

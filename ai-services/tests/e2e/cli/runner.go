@@ -15,8 +15,6 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/project-ai-services/ai-services/internal/pkg/catalog/client"
-	"github.com/project-ai-services/ai-services/internal/pkg/catalog/types"
 	"github.com/project-ai-services/ai-services/internal/pkg/logger"
 	"github.com/project-ai-services/ai-services/internal/pkg/utils"
 	"github.com/project-ai-services/ai-services/internal/pkg/vars"
@@ -244,83 +242,6 @@ func CreateRAGAppAndValidate(
 	logger.Infof("[UI] Chatbot UI available at: %s", chatbotUiURL)
 
 	return output, nil
-}
-
-// AppEndpoints holds the service endpoint URLs resolved from the catalog API.
-// Keys are catalog service IDs (e.g. "chat", "digitize", "similarity").
-// Values are maps of endpoint type → URL (e.g. "api" → "https://...").
-type AppEndpoints map[string]map[string]string
-
-// ChatBackendURL returns the chat service API (backend) URL.
-func (e AppEndpoints) ChatBackendURL() string { return e[catalogSvcChat][endpointTypeAPI] }
-
-// ChatUIURL returns the chat service UI URL.
-func (e AppEndpoints) ChatUIURL() string { return e[catalogSvcChat][endpointTypeUI] }
-
-// DigitizeURL returns the digitize service API (backend) URL.
-func (e AppEndpoints) DigitizeURL() string { return e[catalogSvcDigitize][endpointTypeAPI] }
-
-// SimilarityURL returns the similarity service API URL.
-func (e AppEndpoints) SimilarityURL() string { return e[catalogSvcSimilarity][endpointTypeAPI] }
-
-// ChatMCPURL returns the chat service MCP URL.
-func (e AppEndpoints) ChatMCPURL() string { return e[catalogSvcChat][endpointTypeMCP] }
-
-// DigitizeMCPURL returns the digitize service MCP URL.
-func (e AppEndpoints) DigitizeMCPURL() string { return e[catalogSvcDigitize][endpointTypeMCP] }
-
-// SimilarityMCPURL returns the similarity service MCP URL.
-func (e AppEndpoints) SimilarityMCPURL() string { return e[catalogSvcSimilarity][endpointTypeMCP] }
-
-// SummarizeMCPURL returns the summarize service MCP URL.
-func (e AppEndpoints) SummarizeMCPURL() string { return e[catalogSvcSummarize][endpointTypeMCP] }
-
-// CatalogGetApplicationEndpoints fetches endpoint URLs for a named application via the catalog REST API.
-func CatalogGetApplicationEndpoints(appName string) (AppEndpoints, error) {
-	appClient, err := client.NewApplicationClient(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("catalog client init: %w", err)
-	}
-
-	list, err := appClient.ListApplications(context.Background(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("list applications: %w", err)
-	}
-
-	for _, app := range list.Data {
-		if app.Name == appName {
-			return buildAppEndpoints(app.Services), nil
-		}
-	}
-
-	return nil, fmt.Errorf("application %q not found via catalog API", appName)
-}
-
-// buildAppEndpoints converts a service list into an AppEndpoints map.
-func buildAppEndpoints(services []types.ApplicationService) AppEndpoints {
-	eps := make(AppEndpoints)
-	for _, svc := range services {
-		svcEps := collectEndpoints(svc.Endpoints)
-		if len(svcEps) > 0 {
-			eps[svc.CatalogID] = svcEps
-		}
-	}
-
-	return eps
-}
-
-// collectEndpoints extracts type→URL pairs from an endpoint list.
-func collectEndpoints(endpoints []map[string]any) map[string]string {
-	result := make(map[string]string)
-	for _, ep := range endpoints {
-		epType, _ := ep["type"].(string)
-		epURL, _ := ep["url"].(string)
-		if epType != "" && epURL != "" {
-			result[epType] = epURL
-		}
-	}
-
-	return result
 }
 
 // getRAGURLs returns backend and UI URLs for a deployed RAG application.
